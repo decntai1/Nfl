@@ -1,0 +1,55 @@
+name: NFL refresh
+
+on:
+  schedule:
+    - cron: "15 11 * * *"     # daily 11:15 UTC — after nflverse's overnight pbp/stats update
+    - cron: "15 17 * * 2"     # Tuesday 17:15 UTC — catches late stat corrections after MNF
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: 'Seasons, space-separated (e.g. "2025 2026"). Blank = current season.'
+        required: false
+        default: ""
+      pbp:
+        description: "Publish slim play-by-play table (1/0)"
+        required: false
+        default: "1"
+
+concurrency:
+  group: nfl-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: pip install "pandas>=2.2" numpy requests pyarrow duckdb
+
+      - name: Pull, build, verify, publish
+        env:
+          PROLYT_API_KEY: ${{ secrets.PROLYT_API_KEY || secrets.ANALYTIQ_API_KEY }}
+          PROLYT_URL: ${{ vars.PROLYT_URL || secrets.ANALYTIQ_URL }}
+          NFL_SEASONS: ${{ github.event.inputs.seasons }}
+          NFL_PBP: ${{ github.event.inputs.pbp || '1' }}
+          NFL_OUT: data
+        run: python nfl_ingest.py
+
+      - name: Keep the DuckDB + relationships as a build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfl-duckdb
+          path: |
+            data/nfl_*.duckdb
+            data/nfl_*_relationships.json
+          retention-days: 7
+          if-no-files-found: warn
