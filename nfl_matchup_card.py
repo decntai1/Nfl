@@ -3,7 +3,8 @@
 nfl_matchup_card.py — the weekly matchup step: one side-by-side card per game, a matchup verdict on every priced
 leg, and a running test of whether that verdict adds anything to the book's price.
 
-    python nfl_matchup_card.py card --week 12                         every week-12 game -> data/matchups_w12.md
+    python nfl_matchup_card.py card                                   next week's games -> data/matchups_w<N>.md
+    python nfl_matchup_card.py card --week 12                         every week-12 game
     python nfl_matchup_card.py card --week 11 --games CIN             one game; --priced adds the book's lines
     python nfl_matchup_card.py tag priced_week12/priced_*.csv         adds mx_exp / mx_p / mx_tag to each priced file
     python nfl_matchup_card.py backtest                               every graded ledger leg, walk-forward
@@ -52,8 +53,27 @@ import sys
 import numpy as np
 import pandas as pd
 
+import unicodedata
+
 import nfl_ingest as ing
-from nfl_odds_pricer import BOOK_ABBR, _norm_name, classify
+
+# `card` needs only nfl_ingest.py (so it runs in the repo's GitHub Action); `tag` and `backtest` read vegas.hu
+# markets and need nfl_odds_pricer.py next to this file.
+BOOK_ABBR = {"LAR": "LA", "JAC": "JAX", "WSH": "WAS", "LVR": "LV", "ARZ": "ARI", "BLT": "BAL", "CLV": "CLE", "HST": "HOU"}
+
+
+def _norm_name(x: str) -> str:
+    x = unicodedata.normalize("NFKD", str(x)).encode("ascii", "ignore").decode().lower()
+    x = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b\.?", "", x)
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z ]", "", x)).strip()
+
+
+def classify(market, sel, teams):
+    try:
+        from nfl_odds_pricer import classify as c
+    except ImportError:
+        sys.exit("`tag` / `backtest` need nfl_odds_pricer.py in the same folder (it reads the vegas.hu market names)")
+    return c(market, sel, teams)
 
 OUT = os.environ.get("NFL_OUT", "./data")
 K = 3            # pseudo-games of league average in every team rating
@@ -346,7 +366,14 @@ def book_lines(d: pd.DataFrame, h, a) -> dict:
 
 def card(a):
     D = Data()
-    wk = D.sch[D.sch["week"] == a.week]
+    if a.week is None:      # default: the next week with a game not yet played
+        open_ = D.sch[D.sch["result"].isna()]
+        if open_.empty:
+            sys.exit("no unplayed regular-season games left")
+        a.week = int(open_["week"].min())
+        wk = open_[open_["week"] == a.week]       # only the games still to play (Monday: just MNF)
+    else:
+        wk = D.sch[D.sch["week"] == a.week]
     if a.games:
         wk = wk[wk["home_team"].isin(a.games) | wk["away_team"].isin(a.games)]
     if wk.empty:
@@ -584,7 +611,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("card")
-    c.add_argument("--week", type=int, required=True)
+    c.add_argument("--week", type=int, default=None, help="default: the next week with unplayed games")
     c.add_argument("--games", nargs="*", default=[])
     c.add_argument("--priced", nargs="*", default=[])
     t = sub.add_parser("tag")
