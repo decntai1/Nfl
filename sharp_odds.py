@@ -5,11 +5,13 @@ sharp_odds.py — sharp CONSENSUS prices through The Odds API, compared with veg
 There is no single sharp book for player props (Pinnacle and Circa post few). The fair price is a consensus:
 each book's margin removed on the exact same line, then a weighted median across books that set their own numbers.
 
-    python sharp_odds.py pull --out sharp                     main lines, every NFL game          (~3 credits)
-    python sharp_odds.py pull --props --out sharp             + lean props set                  (~10 credits a game)
+Lives in sharp/ of the Nfl repo; pulls land in sharp/pulls/ (the workflow .github/workflows/sharp-odds.yml runs here).
+
+    python sharp_odds.py pull                                 main lines, every NFL game -> pulls/  (~3 credits)
+    python sharp_odds.py pull --props                         + lean props set                  (~10 credits a game)
     python sharp_odds.py pull --props --set full              + every prop incl. TDs, all alts  (~23 credits a game)
     python sharp_odds.py pull --props --only CIN WAS          props only for games naming CIN or WAS
-    python sharp_odds.py compare sharp/nfl_sharp_<stamp>.csv.gz --priced priced_week12/priced_*.csv
+    python sharp_odds.py compare pulls/nfl_sharp_<stamp>.csv.gz --priced priced_week12/priced_*.csv
     python sharp_odds.py report                               graded record of every logged edge (needs the ledger)
 
 Key: ODDS_API_KEY in the environment (GitHub: repo secret ODDS_API_KEY). Never write the key into a file.
@@ -98,21 +100,49 @@ def pkey(name) -> str:
 
 
 # ================================================================== pull
+class OutOfCredits(Exception):
+    pass
+
+
+LEFT = {"n": None}            # credits left, from the last response header
+
+
 def get(path: str, **params):
+    """JSON, or None for a market/event the API won't serve. Raises OutOfCredits when the quota is gone."""
+    import time
     import requests
     key = os.environ.get("ODDS_API_KEY")
     if not key:
         sys.exit("set ODDS_API_KEY")
-    r = requests.get(f"{API}/{path}", params={"apiKey": key, **params}, timeout=40)
-    left, used = r.headers.get("x-requests-remaining"), r.headers.get("x-requests-last")
     label = path.split("/")[-2] if "/events/" in path else path.split("/")[-1]
-    if r.status_code == 422:                       # a market this plan / event does not offer
-        print(f"  {label}: 422 {r.text[:160]}")
+    for attempt in range(3):
+        try:
+            r = requests.get(f"{API}/{path}", params={"apiKey": key, **params}, timeout=40)
+        except requests.RequestException as e:
+            print(f"  {label}: network error {e}; retry")
+            time.sleep(3 * (attempt + 1))
+            continue
+        left, used = r.headers.get("x-requests-remaining"), r.headers.get("x-requests-last")
+        if left is not None:
+            try:
+                LEFT["n"] = float(left)
+            except ValueError:
+                pass
+        if r.status_code == 200:
+            print(f"  {label:<34} cost {used:>3}  credits left {left}")
+            return r.json()
+        txt = r.text[:200]
+        if r.status_code == 429 and "QUOTA" not in txt.upper() and "CREDIT" not in txt.upper():
+            time.sleep(3 * (attempt + 1))         # too many requests per second: wait and retry
+            continue
+        if r.status_code in (401, 402, 429) and any(w in txt.upper() for w in ("QUOTA", "CREDIT", "USAGE")):
+            raise OutOfCredits(txt)
+        if r.status_code == 401:
+            sys.exit(f"{label}: HTTP 401 {txt}  (wrong or missing key?)")
+        print(f"  {label}: HTTP {r.status_code} {txt} — skipped")   # 422 = market not offered; others: skip game
         return None
-    if r.status_code != 200:
-        sys.exit(f"{path}: HTTP {r.status_code} {r.text[:200]}")
-    print(f"  {label:<34} cost {used:>3}  credits left {left}")
-    return r.json()
+    print(f"  {label}: gave up after 3 tries — skipped")
+    return None
 
 
 def flatten(events: list, stamp: str) -> list[dict]:
@@ -131,27 +161,47 @@ def flatten(events: list, stamp: str) -> list[dict]:
 
 
 def pull(a):
+    """Saves whatever was pulled, always. Out of credits mid-way -> keeps the games already paid for, stops cleanly.
+    Props go nearest kickoff first, so a short quota covers the games you are about to bet."""
     os.makedirs(a.out, exist_ok=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M")
-    ev = get(f"sports/{SPORT}/odds", regions="eu", markets=MAIN, bookmakers=BOOKS, oddsFormat="decimal")
-    rows = flatten(ev, stamp)
+    rows, stopped = [], ""
+    try:
+        ev = get(f"sports/{SPORT}/odds", regions="eu", markets=MAIN, bookmakers=BOOKS, oddsFormat="decimal") or []
+    except OutOfCredits as e:
+        print(f"::error::out of Odds API credits before the first request: {e}")
+        sys.exit(1)
+    rows += flatten(ev, stamp)
     if a.props:
         mk = ",".join(LEAN if a.set == "lean" else PROP_BASE + ([] if a.no_alt else PROP_ALT) + GAME_EXTRA)
-        print(f"  market set: {a.set} ({len(mk.split(','))} markets a game)")
-        for e in ev:
-            if a.only and not any(t in (code(e["home_team"]), code(e["away_team"])) for t in a.only):
-                continue
-            if a.hours and pd.Timestamp(e["commence_time"]) > pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=a.hours):
-                continue
-            x = get(f"sports/{SPORT}/events/{e['id']}/odds", regions="eu", markets=mk, bookmakers=BOOKS,
-                    oddsFormat="decimal")
+        n_mk = len(mk.split(","))
+        print(f"  market set: {a.set} ({n_mk} markets a game, costs up to {n_mk} credits a game)")
+        todo = [e for e in sorted(ev, key=lambda e: e["commence_time"])
+                if (not a.only or any(t in (code(e["home_team"]), code(e["away_team"])) for t in a.only))
+                and pd.Timestamp(e["commence_time"]) > pd.Timestamp.now(tz="UTC")
+                and (not a.hours or pd.Timestamp(e["commence_time"]) <= pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=a.hours))]
+        for i, e in enumerate(todo):
+            if LEFT["n"] is not None and LEFT["n"] < n_mk + a.reserve:
+                stopped = (f"stopped before {e['away_team']} @ {e['home_team']}: {LEFT['n']:.0f} credits left, "
+                           f"a game costs up to {n_mk}, reserve {a.reserve}; {len(todo) - i} game(s) not pulled")
+                break
+            try:
+                x = get(f"sports/{SPORT}/events/{e['id']}/odds", regions="eu", markets=mk, bookmakers=BOOKS,
+                        oddsFormat="decimal")
+            except OutOfCredits as err:
+                stopped = f"out of credits at {e['away_team']} @ {e['home_team']} ({err}); {len(todo) - i} game(s) not pulled"
+                break
             if x:
                 rows += flatten([x], stamp)
     df = pd.DataFrame(rows)
+    if df.empty:
+        print("::warning::nothing pulled (no games listed?)")
+        return
     path = os.path.join(a.out, f"nfl_sharp_{stamp}.csv.gz")
     df.to_csv(path, index=False)
-    print(f"{len(df):,} prices, {df['event_id'].nunique() if len(df) else 0} games, "
-          f"books {sorted(df['book'].unique()) if len(df) else []} -> {path}")
+    print(f"{len(df):,} prices, {df['event_id'].nunique()} games, books {sorted(df['book'].unique())} -> {path}")
+    if stopped:
+        print(f"::warning::{stopped}. Saved what was pulled.")
 
 
 # ================================================================== fair p per book, then consensus
@@ -359,17 +409,18 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p1 = sub.add_parser("pull")
-    p1.add_argument("--out", default="sharp")
+    p1.add_argument("--out", default="pulls")
     p1.add_argument("--props", action="store_true")
     p1.add_argument("--set", choices=["lean", "full"], default="lean",
                     help="lean (default): 10 slip-rule markets, ~10 credits a game; full: 23 markets incl. TDs, ~23")
     p1.add_argument("--no-alt", action="store_true", help="full set without alternate lines")
     p1.add_argument("--only", nargs="*", default=[], help="team codes, props only for these games")
     p1.add_argument("--hours", type=float, default=0, help="props only for games starting within N hours (0 = all)")
+    p1.add_argument("--reserve", type=int, default=5, help="stop props when fewer than (a game's cost + this) credits are left")
     p2 = sub.add_parser("compare")
     p2.add_argument("sharp", nargs="+", help="one or more nfl_sharp_*.csv(.gz); later captures win on duplicates")
     p2.add_argument("--priced", nargs="+", required=True)
-    p2.add_argument("--out", default="sharp/value.csv")
+    p2.add_argument("--out", default="value.csv")
     p2.add_argument("--min-edge", type=float, default=0.0)
     p2.add_argument("--band", nargs=2, type=float, default=[0.60, 0.88], metavar=("LO", "HI"),
                     help="show only legs whose consensus p is in this band (slip rule); all matches are still logged")
