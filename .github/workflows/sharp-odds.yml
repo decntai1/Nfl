@@ -1,6 +1,7 @@
 name: Sharp odds
 
-# Pulls sharp consensus prices from The Odds API and commits them to sharp/ in this repo.
+# Pulls sharp consensus prices from The Odds API and commits them to sharp/pulls/ in this repo.
+# Everything for this job lives in sharp/ (code + pulls); the daily NFL refresh is a separate workflow.
 # Needs the repo secret ODDS_API_KEY (Settings -> Secrets and variables -> Actions -> New repository secret).
 
 on:
@@ -32,6 +33,10 @@ concurrency:
   group: sharp-odds
   cancel-in-progress: false
 
+defaults:
+  run:
+    working-directory: sharp
+
 jobs:
   pull:
     runs-on: ubuntu-latest
@@ -54,16 +59,19 @@ jobs:
           ONLY: ${{ github.event.inputs.only }}
           HOURS: ${{ github.event.inputs.hours || (github.event_name == 'schedule' && '10') || '0' }}
         run: |
-          args="--out sharp --hours $HOURS"
+          args="--out pulls --hours $HOURS"
           [ "$PROPS" = "1" ] && args="$args --props --set $SET"
           [ -n "$ONLY" ] && args="$args --only $ONLY"
           python sharp_odds.py pull $args
 
-      - name: Commit to sharp/
+      - name: Commit to sharp/pulls/
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898341+github-actions[bot]@users.noreply.github.com"
-          git add sharp/*.csv.gz
+          shopt -s nullglob
+          files=(pulls/*.csv.gz)
+          [ ${#files[@]} -eq 0 ] && { echo "nothing pulled"; exit 0; }
+          git add pulls/*.csv.gz
           git diff --cached --quiet && { echo "nothing new"; exit 0; }
           git commit -m "sharp odds $(date -u +%Y-%m-%d_%H%M)"
           for i in 1 2 3; do git pull --rebase -q && git push && break; sleep 5; done
