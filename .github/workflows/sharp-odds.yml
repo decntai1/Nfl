@@ -1,0 +1,69 @@
+name: Sharp odds
+
+# Pulls sharp consensus prices from The Odds API and commits them to sharp/ in this repo.
+# Needs the repo secret ODDS_API_KEY (Settings -> Secrets and variables -> Actions -> New repository secret).
+
+on:
+  schedule:
+    - cron: "20 16 * * 0"     # Sunday 16:20 UTC = 11:20 ET, ~100 min before the 1pm ET games: props for games within 10 h
+  workflow_dispatch:
+    inputs:
+      props:
+        description: "Pull props too (1/0)"
+        required: false
+        default: "1"
+      set:
+        description: "lean = 10 slip-rule markets, ~10 credits/game; full = 23 incl. TDs, ~23 credits/game"
+        required: false
+        default: "lean"
+      only:
+        description: 'Props only for games naming these teams, space-separated (e.g. "CIN WAS"). Blank = all.'
+        required: false
+        default: ""
+      hours:
+        description: "Props only for games starting within N hours (0 = all games listed)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sharp-odds
+  cancel-in-progress: false
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install "pandas>=2.2" numpy requests
+
+      - name: Pull
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PROPS: ${{ github.event.inputs.props || '1' }}
+          SET: ${{ github.event.inputs.set || 'lean' }}
+          ONLY: ${{ github.event.inputs.only }}
+          HOURS: ${{ github.event.inputs.hours || (github.event_name == 'schedule' && '10') || '0' }}
+        run: |
+          args="--out sharp --hours $HOURS"
+          [ "$PROPS" = "1" ] && args="$args --props --set $SET"
+          [ -n "$ONLY" ] && args="$args --only $ONLY"
+          python sharp_odds.py pull $args
+
+      - name: Commit to sharp/
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898341+github-actions[bot]@users.noreply.github.com"
+          git add sharp/*.csv.gz
+          git diff --cached --quiet && { echo "nothing new"; exit 0; }
+          git commit -m "sharp odds $(date -u +%Y-%m-%d_%H%M)"
+          for i in 1 2 3; do git pull --rebase -q && git push && break; sleep 5; done
