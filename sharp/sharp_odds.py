@@ -105,6 +105,8 @@ class OutOfCredits(Exception):
 
 
 LEFT = {"n": None}            # credits left, from the last response header
+LAST = {"status": None, "text": "", "spent": 0}   # last response + credits spent this run
+NOTES: list[str] = []         # every rejected / empty request, shown on the GitHub run page
 
 
 def get(path: str, **params):
@@ -128,6 +130,11 @@ def get(path: str, **params):
                 LEFT["n"] = float(left)
             except ValueError:
                 pass
+        try:
+            LAST["spent"] += int(float(used or 0))
+        except ValueError:
+            pass
+        LAST["status"], LAST["text"] = r.status_code, r.text[:300]
         if r.status_code == 200:
             print(f"  {label:<34} cost {used:>3}  credits left {left}")
             return r.json()
@@ -139,7 +146,9 @@ def get(path: str, **params):
             raise OutOfCredits(txt)
         if r.status_code == 401:
             sys.exit(f"{label}: HTTP 401 {txt}  (wrong or missing key?)")
-        print(f"  {label}: HTTP {r.status_code} {txt} — skipped")   # 422 = market not offered; others: skip game
+        msg = f"{label} {params.get('markets', '')[:60]}: HTTP {r.status_code} {txt}"
+        print(f"::warning::{msg}")                          # 422 = a market not offered; others: skip
+        NOTES.append(msg)
         return None
     print(f"  {label}: gave up after 3 tries — skipped")
     return None
@@ -185,15 +194,28 @@ def pull(a):
                 stopped = (f"stopped before {e['away_team']} @ {e['home_team']}: {LEFT['n']:.0f} credits left, "
                            f"a game costs up to {n_mk}, reserve {a.reserve}; {len(todo) - i} game(s) not pulled")
                 break
+            game = f"{code(e['away_team'])}@{code(e['home_team'])}"
+            url = f"sports/{SPORT}/events/{e['id']}/odds"
             try:
-                x = get(f"sports/{SPORT}/events/{e['id']}/odds", regions="eu", markets=mk, bookmakers=BOOKS,
-                        oddsFormat="decimal")
+                x = get(url, regions="eu", markets=mk, bookmakers=BOOKS, oddsFormat="decimal")
+                if x is None and LAST["status"] == 422:
+                    # one bad market rejects the whole request: retry market by market (a rejected one costs nothing)
+                    NOTES.append(f"{game}: whole request rejected, retrying one market at a time")
+                    for m1 in mk.split(","):
+                        y = get(url, regions="eu", markets=m1, bookmakers=BOOKS, oddsFormat="decimal")
+                        if y:
+                            rows += flatten([y], stamp)
+                    x = None
             except OutOfCredits as err:
-                stopped = f"out of credits at {e['away_team']} @ {e['home_team']} ({err}); {len(todo) - i} game(s) not pulled"
+                stopped = f"out of credits at {game} ({err}); {len(todo) - i} game(s) not pulled"
                 break
             if x:
-                rows += flatten([x], stamp)
+                got = flatten([x], stamp)
+                if not got:
+                    NOTES.append(f"{game}: no prop prices posted yet by these books (cost 0)")
+                rows += got
     df = pd.DataFrame(rows)
+    summary(df, a, stopped)
     if df.empty:
         print("::warning::nothing pulled (no games listed?)")
         return
@@ -202,6 +224,32 @@ def pull(a):
     print(f"{len(df):,} prices, {df['event_id'].nunique()} games, books {sorted(df['book'].unique())} -> {path}")
     if stopped:
         print(f"::warning::{stopped}. Saved what was pulled.")
+
+
+def summary(df: pd.DataFrame, a, stopped: str):
+    """what came back, per game and market, + credits: printed, and on the GitHub run page when run there."""
+    lines = [f"## Sharp odds pull — {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M} UTC",
+             f"**Credits spent this run: {LAST['spent']}** · credits left: {LEFT['n']:.0f}" if LEFT["n"] is not None
+             else f"**Credits spent this run: {LAST['spent']}**", ""]
+    if len(df):
+        df = df.assign(game=df["away"].astype(str) + "@" + df["home"].astype(str))
+        props = df[~df["market"].isin(["h2h", "h2h_lay", "spreads", "totals"])]
+        lines.append(f"Main lines: {df[df.market.isin(['h2h', 'spreads', 'totals'])]['event_id'].nunique()} games, "
+                     f"books: {', '.join(sorted(df['book'].unique()))}")
+        if len(props):
+            lines += ["", "| Game | Market | Books | Prices |", "|---|---|---|---|"]
+            for (g, m), x in props.groupby(["game", "market"]):
+                lines.append(f"| {g} | {m} | {x['book'].nunique()} ({', '.join(sorted(x['book'].unique()))}) | {len(x)} |")
+        elif a.props:
+            lines.append("**No prop prices came back** — see notes.")
+    if NOTES or stopped:
+        lines += ["", "**Notes**"] + [f"- {n}" for n in NOTES] + ([f"- {stopped}"] if stopped else [])
+    text = "\n".join(lines)
+    print(text)
+    p = os.environ.get("GITHUB_STEP_SUMMARY")
+    if p:
+        with open(p, "a") as f:
+            f.write(text + "\n")
 
 
 # ================================================================== fair p per book, then consensus
