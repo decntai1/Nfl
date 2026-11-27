@@ -185,10 +185,25 @@ def pull(a):
         mk = ",".join(LEAN if a.set == "lean" else PROP_BASE + ([] if a.no_alt else PROP_ALT) + GAME_EXTRA)
         n_mk = len(mk.split(","))
         print(f"  market set: {a.set} ({n_mk} markets a game, costs up to {n_mk} credits a game)")
+        # --only: any case, commas / @ / spaces, team codes or nicknames ("den pit", "DEN,PIT", "Broncos")
+        want = {w for w in re.split(r"[\s,@/]+", " ".join(a.only).upper()) if w}
+        alias = {n.upper(): c for n, c in NICK.items()} | {"WSH": "WAS", "LAR": "LA", "JAC": "JAX", "ARZ": "ARI"}
+        want = {alias.get(w, w) for w in want}
+        def hit(e):
+            return not want or bool(want & {code(e["home_team"]), code(e["away_team"])})
+        now = pd.Timestamp.now(tz="UTC")
         todo = [e for e in sorted(ev, key=lambda e: e["commence_time"])
-                if (not a.only or any(t in (code(e["home_team"]), code(e["away_team"])) for t in a.only))
-                and pd.Timestamp(e["commence_time"]) > pd.Timestamp.now(tz="UTC")
-                and (not a.hours or pd.Timestamp(e["commence_time"]) <= pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=a.hours))]
+                if hit(e) and pd.Timestamp(e["commence_time"]) > now
+                and (not a.hours or pd.Timestamp(e["commence_time"]) <= now + pd.Timedelta(hours=a.hours))]
+        if not todo:
+            listed = ", ".join(f"{code(e['away_team'])}@{code(e['home_team'])} {e['commence_time'][5:16]}" for e in
+                               sorted(ev, key=lambda e: e["commence_time"])[:12])
+            msg = (f"props: no game matched only={' '.join(a.only) or '(all)'} hours={a.hours} (kickoff must be in the "
+                   f"future). Next games: {listed}")
+            print(f"::warning::{msg}")
+            NOTES.append(msg)
+        else:
+            print(f"  props for: {', '.join(code(e['away_team']) + '@' + code(e['home_team']) for e in todo)}")
         for i, e in enumerate(todo):
             if LEFT["n"] is not None and LEFT["n"] < n_mk + a.reserve:
                 stopped = (f"stopped before {e['away_team']} @ {e['home_team']}: {LEFT['n']:.0f} credits left, "
